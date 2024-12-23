@@ -54,8 +54,9 @@ class ConfigManager:
         }
 
 class LogManager:
-    LOG_FILE = "pingpanel_logs.json"
-
+    CURRENT_LOG_FILE = "pingpanel_current_logs.json"
+    AGGREGATED_LOG_FILE = "pingpanel_aggregated_logs.json"
+    
     @staticmethod
     def save_log_entry(host: str, group: str, latency: float, timestamp: str, success: bool) -> None:
         log_entry = {
@@ -67,75 +68,152 @@ class LogManager:
         }
         
         existing_logs = []
-        if os.path.exists(LogManager.LOG_FILE):
+        if os.path.exists(LogManager.CURRENT_LOG_FILE):
             try:
-                with open(LogManager.LOG_FILE, 'r') as f:
+                with open(LogManager.CURRENT_LOG_FILE, 'r') as f:
                     existing_logs = json.load(f)
             except json.JSONDecodeError:
                 existing_logs = []
         
         existing_logs.append(log_entry)
         
-        with open(LogManager.LOG_FILE, 'w') as f:
+        # Check if we need to aggregate logs (every hour)
+        current_time = datetime.datetime.now()
+        if existing_logs and len(existing_logs) > 0:
+            first_entry_time = datetime.datetime.fromisoformat(existing_logs[0]["timestamp"])
+            if (current_time - first_entry_time).total_seconds() >= 3600:  # 1 hour
+                LogManager.aggregate_logs(existing_logs)
+                existing_logs = [log_entry]  # Start fresh with current entry
+        
+        with open(LogManager.CURRENT_LOG_FILE, 'w') as f:
             json.dump(existing_logs, f, indent=2)
 
     @staticmethod
+    def aggregate_logs(logs: list) -> None:
+        aggregated_logs = []
+        if os.path.exists(LogManager.AGGREGATED_LOG_FILE):
+            try:
+                with open(LogManager.AGGREGATED_LOG_FILE, 'r') as f:
+                    aggregated_logs = json.load(f)
+            except json.JSONDecodeError:
+                aggregated_logs = []
+
+        # Group logs by host
+        host_logs = {}
+        for log in logs:
+            host = log["host"]
+            if host not in host_logs:
+                host_logs[host] = []
+            host_logs[host].append(log)
+
+        # Create hourly aggregates for each host
+        for host, host_log_entries in host_logs.items():
+            if not host_log_entries:
+                continue
+
+            # Calculate averages
+            total_latency = sum(log["latency"] for log in host_log_entries if log["success"])
+            successful_checks = sum(1 for log in host_log_entries if log["success"])
+            total_checks = len(host_log_entries)
+
+            # Create aggregate entry
+            start_time = min(datetime.datetime.fromisoformat(log["timestamp"]) for log in host_log_entries)
+            aggregate_entry = {
+                "host": host,
+                "group": host_log_entries[0]["group"],
+                "period_start": start_time.isoformat(),
+                "period_end": max(datetime.datetime.fromisoformat(log["timestamp"]) for log in host_log_entries).isoformat(),
+                "avg_latency": total_latency / successful_checks if successful_checks > 0 else 0,
+                "uptime_percentage": (successful_checks / total_checks) * 100 if total_checks > 0 else 0,
+                "total_checks": total_checks
+            }
+            aggregated_logs.append(aggregate_entry)
+
+        # Save aggregated logs
+        with open(LogManager.AGGREGATED_LOG_FILE, 'w') as f:
+            json.dump(aggregated_logs, f, indent=2)
+
+    @staticmethod
     def calculate_uptime(host: str, hours: int = 24) -> float:
-        if not os.path.exists(LogManager.LOG_FILE):
-            return 0.0
+        current_time = datetime.datetime.now()
+        threshold_time = current_time - datetime.timedelta(hours=hours)
         
-        try:
-            with open(LogManager.LOG_FILE, 'r') as f:
-                logs = json.load(f)
-            
-            # Get current time and time threshold
-            current_time = datetime.datetime.now()
-            threshold_time = current_time - datetime.timedelta(hours=hours)
-            
-            # Filter logs for specific host and time period
-            host_logs = [
-                log for log in logs
-                if log['host'] == host and
-                datetime.datetime.fromisoformat(log['timestamp']) > threshold_time
-            ]
-            
-            if not host_logs:
-                return 0.0
-            
-            # Calculate uptime percentage
-            successful_checks = sum(1 for log in host_logs if log['success'])
-            return (successful_checks / len(host_logs)) * 100
-        except Exception:
+        # Get current logs
+        current_logs = []
+        if os.path.exists(LogManager.CURRENT_LOG_FILE):
+            try:
+                with open(LogManager.CURRENT_LOG_FILE, 'r') as f:
+                    current_logs = json.load(f)
+            except json.JSONDecodeError:
+                current_logs = []
+
+        # Get aggregated logs
+        aggregated_logs = []
+        if os.path.exists(LogManager.AGGREGATED_LOG_FILE):
+            try:
+                with open(LogManager.AGGREGATED_LOG_FILE, 'r') as f:
+                    aggregated_logs = json.load(f)
+            except json.JSONDecodeError:
+                aggregated_logs = []
+
+        # Calculate uptime from current logs
+        recent_logs = [
+            log for log in current_logs
+            if log['host'] == host and
+            datetime.datetime.fromisoformat(log['timestamp']) > threshold_time
+        ]
+        
+        # Calculate uptime from aggregated logs
+        relevant_aggregates = [
+            log for log in aggregated_logs
+            if log['host'] == host and
+            datetime.datetime.fromisoformat(log['period_end']) > threshold_time
+        ]
+
+        if not recent_logs and not relevant_aggregates:
             return 0.0
+
+        # Combine results
+        total_checks = len(recent_logs)
+        total_successes = sum(1 for log in recent_logs if log['success'])
+
+        for aggregate in relevant_aggregates:
+            total_checks += aggregate['total_checks']
+            total_successes += (aggregate['total_checks'] * aggregate['uptime_percentage'] / 100)
+
+        return (total_successes / total_checks) * 100 if total_checks > 0 else 0.0
 
     @staticmethod
     def get_last_online(host: str) -> str:
-        if not os.path.exists(LogManager.LOG_FILE):
+        # Check current logs first
+        current_time = None
+        if os.path.exists(LogManager.CURRENT_LOG_FILE):
+            try:
+                with open(LogManager.CURRENT_LOG_FILE, 'r') as f:
+                    logs = json.load(f)
+                    successful_logs = [log for log in logs if log['host'] == host and log['success']]
+                    if successful_logs:
+                        current_time = max(datetime.datetime.fromisoformat(log['timestamp'])
+                                        for log in successful_logs)
+            except Exception:
+                pass
+
+        # Check aggregated logs if needed
+        if not current_time and os.path.exists(LogManager.AGGREGATED_LOG_FILE):
+            try:
+                with open(LogManager.AGGREGATED_LOG_FILE, 'r') as f:
+                    logs = json.load(f)
+                    host_logs = [log for log in logs if log['host'] == host and log['uptime_percentage'] > 0]
+                    if host_logs:
+                        current_time = max(datetime.datetime.fromisoformat(log['period_end'])
+                                        for log in host_logs)
+            except Exception:
+                pass
+
+        if not current_time:
             return "Never"
-        
-        try:
-            with open(LogManager.LOG_FILE, 'r') as f:
-                logs = json.load(f)
-            
-            # Filter logs for specific host where success was True
-            host_logs = [
-                log for log in logs
-                if log['host'] == host and log['success']
-            ]
-            
-            if not host_logs:
-                return "Never"
-            
-            # Get the most recent successful timestamp
-            last_online = max(
-                datetime.datetime.fromisoformat(log['timestamp'])
-                for log in host_logs
-            )
-            
-            # Return formatted timestamp
-            return last_online.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return "Unknown"
+
+        return current_time.strftime("%Y-%m-%d %H:%M:%S")
 
 class PingMonitor:
     @staticmethod
