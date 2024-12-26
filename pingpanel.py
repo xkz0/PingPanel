@@ -67,6 +67,7 @@ class LogManager:
             "success": success
         }
         
+        # Update current logs
         existing_logs = []
         if os.path.exists(LogManager.CURRENT_LOG_FILE):
             try:
@@ -75,63 +76,67 @@ class LogManager:
             except json.JSONDecodeError:
                 existing_logs = []
         
+        # Remove entries older than 1 hour
+        current_time = datetime.datetime.fromisoformat(timestamp)
+        hour_ago = current_time - datetime.timedelta(hours=1)
+        existing_logs = [
+            log for log in existing_logs 
+            if datetime.datetime.fromisoformat(log["timestamp"]) > hour_ago
+        ]
         existing_logs.append(log_entry)
         
-        # Check if we need to aggregate logs (every hour)
-        current_time = datetime.datetime.now()
-        if existing_logs and len(existing_logs) > 0:
-            first_entry_time = datetime.datetime.fromisoformat(existing_logs[0]["timestamp"])
-            if (current_time - first_entry_time).total_seconds() >= 3600:  # 1 hour
-                LogManager.aggregate_logs(existing_logs)
-                existing_logs = [log_entry]  # Start fresh with current entry
-        
+        # Save current logs
         with open(LogManager.CURRENT_LOG_FILE, 'w') as f:
             json.dump(existing_logs, f, indent=2)
+        
+        # Immediately update aggregated logs
+        LogManager.update_aggregated_logs(host, group, latency, timestamp, success)
 
     @staticmethod
-    def aggregate_logs(logs: list) -> None:
-        aggregated_logs = []
+    def update_aggregated_logs(host: str, group: str, latency: float, timestamp: str, success: bool) -> None:
+        aggregated_logs = {}
         if os.path.exists(LogManager.AGGREGATED_LOG_FILE):
             try:
                 with open(LogManager.AGGREGATED_LOG_FILE, 'r') as f:
-                    aggregated_logs = json.load(f)
+                    # Convert list to dict with host as key for easier updating
+                    aggregated_logs = {entry["host"]: entry for entry in json.load(f)}
             except json.JSONDecodeError:
-                aggregated_logs = []
-
-        # Group logs by host
-        host_logs = {}
-        for log in logs:
-            host = log["host"]
-            if host not in host_logs:
-                host_logs[host] = []
-            host_logs[host].append(log)
-
-        # Create hourly aggregates for each host
-        for host, host_log_entries in host_logs.items():
-            if not host_log_entries:
-                continue
-
-            # Calculate averages
-            total_latency = sum(log["latency"] for log in host_log_entries if log["success"])
-            successful_checks = sum(1 for log in host_log_entries if log["success"])
-            total_checks = len(host_log_entries)
-
-            # Create aggregate entry
-            start_time = min(datetime.datetime.fromisoformat(log["timestamp"]) for log in host_log_entries)
-            aggregate_entry = {
+                aggregated_logs = {}
+        
+        # Update or create entry for this host
+        if host in aggregated_logs:
+            entry = aggregated_logs[host]
+            total_checks = entry["total_checks"] + 1
+            if success:
+                # Update running average for latency
+                old_total = entry["avg_latency"] * entry["total_checks"]
+                new_avg = (old_total + latency) / total_checks
+                entry["avg_latency"] = new_avg
+                entry["last_successful"] = timestamp
+            
+            # Update uptime percentage
+            successful_checks = (entry["uptime_percentage"] / 100 * entry["total_checks"])
+            if success:
+                successful_checks += 1
+            entry["uptime_percentage"] = (successful_checks / total_checks) * 100
+            entry["total_checks"] = total_checks
+            entry["last_check"] = timestamp
+            
+        else:
+            # Create new entry
+            aggregated_logs[host] = {
                 "host": host,
-                "group": host_log_entries[0]["group"],
-                "period_start": start_time.isoformat(),
-                "period_end": max(datetime.datetime.fromisoformat(log["timestamp"]) for log in host_log_entries).isoformat(),
-                "avg_latency": total_latency / successful_checks if successful_checks > 0 else 0,
-                "uptime_percentage": (successful_checks / total_checks) * 100 if total_checks > 0 else 0,
-                "total_checks": total_checks
+                "group": group,
+                "avg_latency": latency if success else 0,
+                "uptime_percentage": 100 if success else 0,
+                "total_checks": 1,
+                "last_check": timestamp,
+                "last_successful": timestamp if success else None
             }
-            aggregated_logs.append(aggregate_entry)
-
-        # Save aggregated logs
+        
+        # Save updated aggregated logs
         with open(LogManager.AGGREGATED_LOG_FILE, 'w') as f:
-            json.dump(aggregated_logs, f, indent=2)
+            json.dump(list(aggregated_logs.values()), f, indent=2)
 
     @staticmethod
     def calculate_uptime(host: str, hours: int = 24) -> float:
@@ -163,57 +168,52 @@ class LogManager:
             datetime.datetime.fromisoformat(log['timestamp']) > threshold_time
         ]
         
-        # Calculate uptime from aggregated logs
-        relevant_aggregates = [
-            log for log in aggregated_logs
-            if log['host'] == host and
-            datetime.datetime.fromisoformat(log['period_end']) > threshold_time
-        ]
+        # Get the relevant aggregated log entry
+        host_aggregate = next(
+            (log for log in aggregated_logs if log['host'] == host and
+             datetime.datetime.fromisoformat(log['last_check']) > threshold_time),
+            None
+        )
 
-        if not recent_logs and not relevant_aggregates:
+        if not recent_logs and not host_aggregate:
             return 0.0
 
-        # Combine results
+        # Calculate total uptime percentage
         total_checks = len(recent_logs)
         total_successes = sum(1 for log in recent_logs if log['success'])
 
-        for aggregate in relevant_aggregates:
-            total_checks += aggregate['total_checks']
-            total_successes += (aggregate['total_checks'] * aggregate['uptime_percentage'] / 100)
+        if host_aggregate:
+            total_checks += host_aggregate['total_checks']
+            total_successes += (host_aggregate['total_checks'] * host_aggregate['uptime_percentage'] / 100)
 
         return (total_successes / total_checks) * 100 if total_checks > 0 else 0.0
 
     @staticmethod
     def get_last_online(host: str) -> str:
-        # Check current logs first
-        current_time = None
+        # Check aggregated logs first for last successful timestamp
+        if os.path.exists(LogManager.AGGREGATED_LOG_FILE):
+            try:
+                with open(LogManager.AGGREGATED_LOG_FILE, 'r') as f:
+                    logs = json.load(f)
+                    for log in logs:
+                        if log['host'] == host and log.get('last_successful'):
+                            return datetime.datetime.fromisoformat(log['last_successful']).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+        
+        # If no aggregated log found, check current logs
         if os.path.exists(LogManager.CURRENT_LOG_FILE):
             try:
                 with open(LogManager.CURRENT_LOG_FILE, 'r') as f:
                     logs = json.load(f)
                     successful_logs = [log for log in logs if log['host'] == host and log['success']]
                     if successful_logs:
-                        current_time = max(datetime.datetime.fromisoformat(log['timestamp'])
-                                        for log in successful_logs)
+                        latest = max(successful_logs, key=lambda x: x['timestamp'])
+                        return datetime.datetime.fromisoformat(latest['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 pass
 
-        # Check aggregated logs if needed
-        if not current_time and os.path.exists(LogManager.AGGREGATED_LOG_FILE):
-            try:
-                with open(LogManager.AGGREGATED_LOG_FILE, 'r') as f:
-                    logs = json.load(f)
-                    host_logs = [log for log in logs if log['host'] == host and log['uptime_percentage'] > 0]
-                    if host_logs:
-                        current_time = max(datetime.datetime.fromisoformat(log['period_end'])
-                                        for log in host_logs)
-            except Exception:
-                pass
-
-        if not current_time:
-            return "Never"
-
-        return current_time.strftime("%Y-%m-%d %H:%M:%S")
+        return "Never"
 
 class PingMonitor:
     @staticmethod
@@ -308,18 +308,23 @@ class TableScreen(Screen):
     def on_mount(self) -> None:
         tree = self.query_one("#host_tree")
         
+        # Initialize counters to 0
+        self.total_up = 0
+        self.total_down = 0
+        
         for group, hosts in self.groups.items():
             group_node = tree.root.add(group)
             for hostname, ip in hosts:
                 label = f"{hostname} ({ip}) ⟳"
                 host_node = group_node.add(label)
                 self.host_nodes[(group, hostname)] = host_node
+                # Set initial state as None
+                self.host_states[(group, hostname)] = None
 
     async def check_single_host(self, group: str, hostname: str, ip: str) -> None:
         async with self.ping_semaphore:
             host_node = self.host_nodes[(group, hostname)]
             status = self.query_one("#status")
-            status.update(f"Status: Checking {hostname}...")
             
             config = ConfigManager.load_config()
             is_alive, latency = await PingMonitor.ping(ip, config["ping_count"])
@@ -340,10 +345,26 @@ class TableScreen(Screen):
             
             prev_state = self.host_states.get((group, hostname))
             
-            if prev_state is not None and prev_state != is_acceptable:
+            # Update totals only on state changes or first check
+            if prev_state is None:
+                # First check for this host
+                if is_acceptable:
+                    self.total_up += 1
+                else:
+                    self.total_down += 1
+            elif prev_state != is_acceptable:
+                # State changed - ensure we don't go negative
+                if is_acceptable and self.total_down > 0:
+                    self.total_up += 1
+                    self.total_down -= 1
+                elif not is_acceptable and self.total_up > 0:
+                    self.total_down += 1
+                    self.total_up -= 1
                 change_text = f"{hostname} is now {'ONLINE' if is_acceptable else 'OFFLINE'}"
                 self.last_state_change = change_text
                 status.update(f"Status: {change_text}")
+            else:
+                status.update(f"Status: Checking {hostname}...")
             
             if is_acceptable:
                 status_icon = "✓"
@@ -360,17 +381,13 @@ class TableScreen(Screen):
             
             host_node.label = f"{hostname} ({ip}) {icon_markup} [{status_text}] [blue]{uptime:.1f}%[/]{last_seen}"
             
-            # Update total counters
-            if is_acceptable:
-                self.total_up += 1
-            else:
-                self.total_down += 1
+            # Update the totals display after each host check
+            self.query_one("#total_up").update(f"[green]Up: {self.total_up}[/]")
+            self.query_one("#total_down").update(f"[red]Down: {self.total_down}[/]")
 
     async def check_hosts(self) -> None:
         status = self.query_one("#status")
         status.update("Status: Starting host checks...")
-        self.total_up = 0
-        self.total_down = 0
         
         try:
             tasks = []
@@ -380,10 +397,6 @@ class TableScreen(Screen):
                     tasks.append(task)
             
             await asyncio.gather(*tasks)
-            
-            # Update totals display
-            self.query_one("#total_up").update(f"[green]Up: {self.total_up}[/]")
-            self.query_one("#total_down").update(f"[red]Down: {self.total_down}[/]")
             
             if self.last_state_change:
                 status.update(f"Status: {self.last_state_change}")
